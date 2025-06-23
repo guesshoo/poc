@@ -1,0 +1,154 @@
+namespace cache.imap;
+
+// Client-Server protocol for IMap-like distributed map
+// file_identifier provides a 4-byte magic for validation
+file_identifier "IMAP";
+
+/// Common header for all requests
+table RequestHeader {
+  // Unique per-connection, per-request sequence
+  request_id: ulong;
+  // Logical timestamp or client-provided sequence for ordering/read consistency
+  timestamp: ulong;
+}
+
+/// Common header for all responses
+table ResponseHeader {
+  request_id: ulong;        // echoes RequestHeader.request_id
+  success: bool;            // indicates operation success
+  error_code: uint;         // 0 = OK, other = error
+  error_msg: string;        // optional error description
+}
+
+// --------------- Request Messages ---------------- //
+
+/// Get a value by key
+table GetRequest {
+  header: RequestHeader (required);
+  map_name: string (required);
+  key: [ubyte] (required);
+}
+
+/// Put a key-value (overwrites existing)
+table PutRequest {
+  header: RequestHeader (required);
+  map_name: string (required);
+  key: [ubyte] (required);
+  value: [ubyte] (required);
+}
+
+/// Remove a value by key
+table RemoveRequest {
+  header: RequestHeader (required);
+  map_name: string (required);
+  key: [ubyte] (required);
+}
+
+/// Conditional put: only if absent
+table PutIfAbsentRequest {
+  header: RequestHeader (required);
+  map_name: string (required);
+  key: [ubyte] (required);
+  value: [ubyte] (required);
+}
+
+/// Conditional remove: only if value matches
+table RemoveIfEqualsRequest {
+  header: RequestHeader (required);
+  map_name: string (required);
+  key: [ubyte] (required);
+  old_value: [ubyte] (required);
+}
+
+/// Clear the entire map
+table ClearRequest {
+  header: RequestHeader (required);
+  map_name: string (required);
+}
+
+/// Request a range scan or iterate starting from key
+table ScanRequest {
+  header: RequestHeader (required);
+  map_name: string (required);
+  start_key: [ubyte];      // optional cursor
+  count: uint;             // max entries to return
+}
+
+/// Union of all request types
+union Request {
+  GetRequest,
+  PutRequest,
+  RemoveRequest,
+  PutIfAbsentRequest,
+  RemoveIfEqualsRequest,
+  ClearRequest,
+  ScanRequest
+}
+
+// --------------- Response Messages ---------------- //
+
+/// Response to GetRequest
+table GetResponse {
+  header: ResponseHeader (required);
+  value: [ubyte];          // if success and key existed
+}
+
+/// Response to PutRequest
+/// Returns previous value if any
+table PutResponse {
+  header: ResponseHeader (required);
+  previous_value: [ubyte]; // empty if none
+}
+
+/// Response to RemoveRequest
+table RemoveResponse {
+  header: ResponseHeader (required);
+  removed_value: [ubyte];  // empty if none
+}
+
+/// Response to PutIfAbsentRequest
+table PutIfAbsentResponse {
+  header: ResponseHeader (required);
+  existed: bool;           // true if key already existed
+  existing_value: [ubyte]; // populated if existed==true
+}
+
+/// Response to RemoveIfEqualsRequest
+table RemoveIfEqualsResponse {
+  header: ResponseHeader (required);
+  removed: bool;           // true if removed
+}
+
+/// Response to ClearRequest
+table ClearResponse {
+  header: ResponseHeader (required);
+}
+
+/// Response to ScanRequest
+table ScanResponse {
+  header: ResponseHeader (required);
+  keys: [[ubyte]];         // list of keys
+  values: [[ubyte]];       // parallel list of values
+  more: bool;              // true if more entries remain
+}
+
+/// Union of all response types
+union Response {
+  GetResponse,
+  PutResponse,
+  RemoveResponse,
+  PutIfAbsentResponse,
+  RemoveIfEqualsResponse,
+  ClearResponse,
+  ScanResponse
+}
+
+// --------------- Envelope ---------------- //
+
+/// Top-level message carrier
+table Envelope {
+  request: Request;        // either request or response
+  response: Response;
+}
+
+root_type Envelope;

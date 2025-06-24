@@ -1,0 +1,225 @@
+// src/lib.rs
+
+// --- in Cargo.toml ---
+// [dependencies]
+// serde       = { version = "1.0", features = ["derive"] }
+// serde_cbor  = "0.11"
+// tokio       = { version = "1", features = ["fs", "io-util", "macros", "rt"] }
+// tempfile    = "3"
+
+use serde::{Deserialize, Serialize};
+use std::{io, path::Path};
+use tokio::{
+    fs::OpenOptions,
+    io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
+};
+
+/// 4‐byte magic at the start of each record for quick corruption checks
+pub const FILE_IDENTIFIER: [u8; 4] = *b"WALR";
+
+/// Union of possible operations stored in the WAL.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(tag = "type", content = "payload")]
+pub enum Command {
+    Set(SetCommand),
+    Delete(DeleteCommand),
+    Snapshot(SnapshotCommand),
+}
+
+/// A single WAL entry: Raft term & index + an application command.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct WalRecord {
+    pub term: u64,
+    pub index: u64,
+    pub op: Command,
+}
+
+/// Command to set a key to a value.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct SetCommand {
+    pub key: Vec<u8>,
+    pub value: Vec<u8>,
+}
+
+/// Command to delete a key.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct DeleteCommand {
+    pub key: Vec<u8>,
+}
+
+/// Snapshot install command: term, index, checksum, and raw snapshot data.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct SnapshotCommand {
+    pub snapshot_term: u64,
+    pub snapshot_index: u64,
+    pub checksum: u64,
+    pub data: Vec<u8>,
+}
+
+/// Asynchronous WAL writer: appends records to disk using Tokio.
+/// Format per record: [4‐byte magic][8‐byte BE length][CBOR payload]
+pub struct AsyncWalWriter {
+    inner: BufWriter<tokio::fs::File>,
+}
+
+impl AsyncWalWriter {
+    /// Open (or create) the WAL file in append mode.
+    pub async fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .await?;
+        Ok(Self {
+            inner: BufWriter::new(file),
+        })
+    }
+
+    /// Serialize & append one record, then flush it out.
+    pub async fn append(&mut self, record: &WalRecord) -> io::Result<()> {
+        // 1) CBOR‐encode the record
+        let payload = serde_cbor::to_vec(record)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let len = payload.len() as u64;
+
+        // 2) Write magic
+        self.inner.write_all(&FILE_IDENTIFIER).await?;
+        // 3) Write length prefix (big‐endian u64)
+        self.inner.write_all(&len.to_be_bytes()).await?;
+        // 4) Write payload
+        self.inner.write_all(&payload).await?;
+        // 5) Flush through buffers to disk
+        self.inner.flush().await?;
+        Ok(())
+    }
+}
+
+/// Asynchronous WAL reader: sequentially reads framed CBOR records.
+/// On clean EOF, `next()` → `Ok(None)`. On error or corruption, → `Err`.
+pub struct AsyncWalReader {
+    inner: BufReader<tokio::fs::File>,
+}
+
+impl AsyncWalReader {
+    /// Open an existing WAL file for reading.
+    pub async fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        let file = tokio::fs::File::open(path).await?;
+        Ok(Self {
+            inner: BufReader::new(file),
+        })
+    }
+
+    /// Pull the next record off disk.
+    /// - `Ok(None)`: reached EOF cleanly.
+    /// - `Err(_)`: IO error or corrupted framing.
+    pub async fn next(&mut self) -> io::Result<Option<WalRecord>> {
+        // 1) Try to read the 4‐byte magic
+        let mut magic = [0u8; 4];
+        match self.inner.read_exact(&mut magic).await {
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(e),
+            Ok(_x) => {}
+        }
+        if magic != FILE_IDENTIFIER {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "invalid magic: expected {:?}, got {:?}",
+                    FILE_IDENTIFIER, magic
+                ),
+            ));
+        }
+
+        // 2) Read the 8‐byte big‐endian length
+        let mut len_buf = [0u8; 8];
+        self.inner.read_exact(&mut len_buf).await?;
+        let len = u64::from_be_bytes(len_buf);
+
+        // 3) Read the CBOR payload
+        let mut payload = vec![0u8; len as usize];
+        self.inner.read_exact(&mut payload).await?;
+
+        // 4) Deserialize
+        let record: WalRecord = serde_cbor::from_slice(&payload)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        Ok(Some(record))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+
+    /// Build a simple Set record
+    fn make_set(term: u64, index: u64, k: &[u8], v: &[u8]) -> WalRecord {
+        WalRecord {
+            term,
+            index,
+            op: Command::Set(SetCommand {
+                key: k.to_vec(),
+                value: v.to_vec(),
+            }),
+        }
+    }
+
+    /// Build a simple Delete record
+    fn make_delete(term: u64, index: u64, k: &[u8]) -> WalRecord {
+        WalRecord {
+            term,
+            index,
+            op: Command::Delete(DeleteCommand {
+                key: k.to_vec(),
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn round_trip_async() {
+        // create temp file path
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path();
+
+        // sample records
+        let records = vec![
+            make_set(1, 1, b"foo", b"bar"),
+            make_delete(1, 2, b"foo"),
+            WalRecord {
+                term: 2,
+                index: 3,
+                op: Command::Snapshot(SnapshotCommand {
+                    snapshot_term: 2,
+                    snapshot_index: 3,
+                    checksum: 0xDEADBEEF,
+                    data: vec![1, 2, 3, 4],
+                }),
+            },
+        ];
+
+        // write them
+        let mut w = AsyncWalWriter::new(path).await.unwrap();
+        for r in &records {
+            w.append(r).await.unwrap();
+        }
+
+        // read them back
+        let mut r = AsyncWalReader::new(path).await.unwrap();
+        for expected in &records {
+            let got = r.next().await.unwrap().expect("missing record");
+            assert_eq!(&got, expected);
+        }
+        // EOF
+        assert!(r.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn detect_bad_magic() {
+        let tmp = NamedTempFile::new().unwrap();
+        // write wrong magic sync
+        std::fs::write(tmp.path(), b"BAD!XXXXXXXX").unwrap();
+
+        let mut r = AsyncWalReader::new(tmp.path()).await.unwrap();
+        let err = r.next().await.unwrap_err();
+        assert!(matches!(err.kind(), io::ErrorKind::InvalidData));
+    }
+}
